@@ -1,1 +1,17 @@
-/.metadata/
+# Workspace / IDE
+.metadata/
+.mcuxpressoide_packages_support/
+RemoteSystemsTempFiles/
+*.launch
+
+# Build
+Debug/
+Release/
+*.o
+*.d
+*.su
+*.a
+*.axf
+*.bin
+*.hex
+*.map
