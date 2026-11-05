@@ -15,6 +15,11 @@
  *   Joystick SW  -> P0.21 (GPIO con interrupcion, pull-up interno, activo en bajo)
  *   Joystick +5V -> 3V3 de la placa (NO a 5V: el ADC admite como maximo 3,3 V)
  *
+ *   Servo SG90 senal (naranja) -> P2.4 (PWM1.5)
+ *   Servo SG90 +5V (rojo)      -> fuente externa de 5 V
+ *   Servo SG90 GND (marron)    -> GND de la fuente, unido al GND de la placa
+ *   En modo MANUAL, joystick arriba/abajo mueve el servo; en AUTOMATICO queda quieto.
+ *
  * Indicador de modo (LED RGB de la placa, activo en bajo):
  *   Verde (P3.25) = automatico, Azul (P3.26) = manual.
  *
@@ -26,6 +31,7 @@
 #include "lpc17xx_adc.h"
 #include "lpc17xx_gpio.h"
 #include "lpc17xx_pinsel.h"
+#include "lpc17xx_clkpwr.h"
 
 /* ------------------------------ Configuracion ------------------------------ */
 #define NUM_LDR         4
@@ -43,6 +49,15 @@
 #define JOY_THRESHOLD   600       /* Cuentas desde el centro para cambiar de lado */
 #define JOY_INVERT_X    0         /* Poner en 1 si izquierda/derecha quedan al reves */
 #define JOY_INVERT_Y    0         /* Poner en 1 si arriba/abajo quedan al reves */
+
+/* Servo (PWM1.5 en P2.4) */
+#define SERVO_PERIOD_US 20000U    /* 50 Hz */
+#define SERVO_MIN_US    1000U     /* Extremo 1 (ampliar a ~500 si el servo lo permite) */
+#define SERVO_MAX_US    2000U     /* Extremo 2 (ampliar a ~2400 si el servo lo permite) */
+#define SERVO_CENTER_US 1500U
+#define SERVO_MAX_STEP  20        /* us por ciclo de 20 ms con el joystick al tope */
+#define SERVO_DEADZONE  200       /* Cuentas alrededor del centro sin movimiento */
+#define SERVO_INVERT    0         /* Poner en 1 para invertir el sentido */
 
 /* Pulsador */
 #define SW_PORT         PORT_0
@@ -69,6 +84,7 @@ volatile uint16_t ldrValue[NUM_LDR];
 volatile uint16_t joyValue[2];       /* [0] = X, [1] = Y */
 volatile uint16_t joyCenter[2];
 volatile uint8_t  manualMode = 0;    /* 0 = automatico, 1 = manual */
+volatile uint32_t servoPulseUs = SERVO_CENTER_US;
 
 static volatile uint32_t msTicks    = 0;
 static volatile uint32_t lastEdgeMs = 0;
@@ -175,6 +191,79 @@ static void SW_Init(void) {
     NVIC_EnableIRQ(EINT3_IRQn);
 }
 
+/* ---------------------------------- Servo ---------------------------------- */
+/** Fija el ancho de pulso; se aplica al comienzo del proximo periodo. */
+static void SERVO_SetPulse(uint32_t us) {
+    if (us < SERVO_MIN_US) {
+        us = SERVO_MIN_US;
+    } else if (us > SERVO_MAX_US) {
+        us = SERVO_MAX_US;
+    }
+    servoPulseUs  = us;
+    LPC_PWM1->MR5 = us;
+    LPC_PWM1->LER = (1U << 5);  /* Latch de MR5 */
+}
+
+/**
+ * PWM1 con el contador a 1 MHz (1 tick = 1 us):
+ * MR0 = periodo de 20 ms, MR5 = ancho de pulso. Salida simple flanco en PWM1.5.
+ */
+static void SERVO_Init(void) {
+    PINSEL_CFG_T cfg = {
+        .port      = PORT_2,
+        .pin       = PIN_4,
+        .func      = PINSEL_FUNC_01,  /* PWM1.5 */
+        .mode      = PINSEL_TRISTATE,
+        .openDrain = DISABLE
+    };
+    PINSEL_ConfigPin(&cfg);
+
+    CLKPWR_ConfigPPWR(CLKPWR_PCONP_PCPWM1, ENABLE);
+    const uint32_t pclk = CLKPWR_GetPCLK(CLKPWR_PCLKSEL_PWM1);
+
+    LPC_PWM1->TCR = (1U << 1);              /* Reset del contador */
+    LPC_PWM1->PR  = pclk / 1000000U - 1U;   /* Tick de 1 us */
+    LPC_PWM1->MR0 = SERVO_PERIOD_US;
+    LPC_PWM1->MR5 = SERVO_CENTER_US;
+    LPC_PWM1->MCR = (1U << 1);              /* Reinicia el contador en MR0 */
+    LPC_PWM1->PCR = (1U << 13);             /* Habilita salida PWM1.5 (simple flanco) */
+    LPC_PWM1->LER = (1U << 0) | (1U << 5);
+    LPC_PWM1->TCR = (1U << 0) | (1U << 3);  /* Contador + modo PWM habilitados */
+
+    servoPulseUs = SERVO_CENTER_US;
+}
+
+/**
+ * Control por velocidad: cuanto mas se inclina el joystick en Y, mas rapido se
+ * mueve el servo. Al soltarlo, el servo se queda en la ultima posicion.
+ */
+static void SERVO_UpdateFromJoystick(void) {
+    int32_t dy = (int32_t)joyValue[1] - (int32_t)joyCenter[1];
+#if JOY_INVERT_Y
+    dy = -dy;
+#endif
+#if SERVO_INVERT
+    dy = -dy;
+#endif
+
+    int32_t mag = dy < 0 ? -dy : dy;
+    if (mag <= SERVO_DEADZONE) {
+        return;
+    }
+
+    int32_t step = (mag - SERVO_DEADZONE) * SERVO_MAX_STEP / (2048 - SERVO_DEADZONE);
+    if (step < 1) {
+        step = 1;
+    }
+
+    /* Joystick arriba (dy < 0) aumenta el pulso; abajo lo disminuye */
+    int32_t pulse = (int32_t)servoPulseUs + (dy < 0 ? step : -step);
+    if (pulse < 0) {
+        pulse = 0;
+    }
+    SERVO_SetPulse((uint32_t)pulse);
+}
+
 /* ----------------------------------- ADC ----------------------------------- */
 /** AD0.0..AD0.5 configurados y ADC en modo burst. */
 static void ADC_Setup(void) {
@@ -247,9 +336,12 @@ static void JOY_Calibrate(void) {
  * Si no, conserva el lado actual. Asi, al empujar solo hacia arriba se
  * mantiene la columna, y en reposo queda encendido el ultimo LED elegido.
  */
-static uint8_t JOY_GetLed(uint8_t current) {
+static void JOY_Read(void) {
     ADC_ReadAverage(joyChannel, 2, joyValue);
+}
 
+/** Usa la ultima lectura de JOY_Read(). */
+static uint8_t JOY_GetLed(uint8_t current) {
     int32_t dx = (int32_t)joyValue[0] - (int32_t)joyCenter[0];
     int32_t dy = (int32_t)joyValue[1] - (int32_t)joyCenter[1];
 #if JOY_INVERT_X
@@ -293,6 +385,7 @@ int main(void) {
     ADC_Setup();
     delay_ms(10);
     JOY_Calibrate();
+    SERVO_Init();
     SW_Init();
 
     while (1) {
@@ -303,7 +396,14 @@ int main(void) {
             RGB_ShowMode(mode);
         }
 
-        const uint8_t next = mode ? JOY_GetLed(current) : LDR_GetBrightest(current);
+        uint8_t next;
+        if (mode) {
+            JOY_Read();
+            next = JOY_GetLed(current);
+            SERVO_UpdateFromJoystick();
+        } else {
+            next = LDR_GetBrightest(current);
+        }
 
         if (next != current) {
             current = next;
