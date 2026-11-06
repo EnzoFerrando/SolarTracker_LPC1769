@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="es">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Panel solar · ED3</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#eef3ef;color:#17392e;font:16px system-ui,sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px}main{width:min(100%,570px)}header{display:flex;align-items:center;gap:14px;margin-bottom:28px}.sun{font-size:36px;color:#b98620}h1{font-size:25px;margin:0}header p{margin:5px 0;color:#66786f;font-size:14px}.card{background:#fff;border:1px solid #dbe6dd;border-radius:26px;padding:32px;box-shadow:0 18px 60px #16382b0a}.top{display:flex;align-items:center;justify-content:space-between;gap:12px}.label{font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:#66786f}.badge{font-size:12px;background:#edf2ee;padding:7px 11px;border-radius:30px}.reading{font-size:clamp(60px,14vw,88px);font-weight:650;letter-spacing:-.055em;margin:28px 0 6px;font-variant-numeric:tabular-nums}.unit{font-size:30px;color:#7d9184;margin-left:10px;letter-spacing:0}.sub{color:#66786f;font-size:14px;min-height:22px}.meta{display:flex;justify-content:space-between;margin:28px 0;padding-top:20px;border-top:1px solid #e7ede8;font-size:13px;color:#66786f}button{width:100%;border:0;background:#245f48;color:#fff;padding:15px;border-radius:13px;font:600 15px system-ui;cursor:pointer}button:disabled{opacity:.55;cursor:wait}#notice{font-size:14px;line-height:1.5;margin-top:16px;min-height:42px}.help{font-size:13px;line-height:1.7;color:#66786f;padding:18px 6px}code{font-size:12px}footer{font-size:11px;letter-spacing:.13em;color:#7d9184;text-transform:uppercase;margin-top:10px}
+</style>
+<main>
+<header><span class="sun" aria-hidden="true">☀</span><div><h1>Panel solar</h1><p>Primera medición · LPC1769</p></div></header>
+<section class="card">
+<div class="top"><span class="label">Tensión del panel</span><span class="badge" id="state">Desconectado</span></div>
+<div class="reading" aria-live="polite"><span id="voltage">—</span><span class="unit">V</span></div>
+<div class="sub" id="subtitle">Conectá el puerto serie para recibir datos.</div>
+<div class="meta"><span>ADC <b id="adc">—</b> / 4095</span><span id="updated">Sin muestras</span></div>
+<button id="connect">Conectar panel</button>
+<div id="notice" role="status">Elegí el COM del adaptador USB–UART. Velocidad 115200 baudios.</div>
+</section>
+<div class="help">Abrí este archivo en Chrome o Edge de escritorio. Cerrá cualquier terminal que esté usando el mismo COM.<br>Entrada P0.23 con divisor de 10 kΩ / 4,7 kΩ. Transmisión por P0.10 → RX del adaptador.</div>
+<footer>Electrónica Digital 3 · Seguimiento solar</footer>
+</main>
+<script>
+'use strict';
+const ui = Object.fromEntries(['state','voltage','subtitle','adc','updated','connect','notice'].map(id => [id,document.getElementById(id)]));
+let port = null;
+let reader = null;
+let stopping = false;
+let connecting = false;
+let lastSample = 0;
+let received = 0;
+
+function sample(line) {
+  let data;
+  try { data = JSON.parse(line); } catch { return; }
+  if (!data || !Number.isFinite(data.panel_mv) || data.panel_mv < 0 || data.panel_mv > 11000 || !Number.isInteger(data.adc) || data.adc < 0 || data.adc > 4095) return;
+  lastSample = Date.now();
+  received++;
+  ui.voltage.textContent = (data.panel_mv / 1000).toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2});
+  ui.adc.textContent = data.adc;
+  ui.state.textContent = data.adc >= 4090 ? 'ADC saturado' : 'Recibiendo';
+  ui.subtitle.textContent = data.adc >= 4090 ? 'Revisá el divisor y la tensión antes de continuar.' : 'Tensión medida con promedio de 32 muestras.';
+  ui.updated.textContent = new Date().toLocaleTimeString('es-AR');
+  ui.notice.textContent = 'Comunicación activa · ' + received + ' muestras recibidas.';
+}
+
+async function receive() {
+  const decoder = new TextDecoder();
+  let pending = '';
+  try {
+    reader = port.readable.getReader();
+    while (!stopping) {
+      const {value,done} = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value,{stream:true});
+      let newline;
+      while ((newline = pending.indexOf('\n')) !== -1) {
+        sample(pending.slice(0,newline).trim());
+        pending = pending.slice(newline + 1);
+      }
+      if (pending.length > 4096) pending = '';
+    }
+  } catch (error) {
+    if (!stopping) ui.notice.textContent = 'Se interrumpió la conexión. ' + error.message;
+  } finally {
+    if (reader) { reader.releaseLock(); reader = null; }
+    if (port) {
+      try { await port.close(); } catch {}
+      port = null;
+    }
+    ui.state.textContent = 'Desconectado';
+    ui.subtitle.textContent = 'Última lectura conservada. Reconectá para actualizar.';
+    ui.connect.textContent = 'Conectar panel';
+    ui.connect.disabled = false;
+  }
+}
+
+ui.connect.addEventListener('click',async () => {
+  if (connecting) return;
+  if (port) {
+    stopping = true;
+    ui.connect.disabled = true;
+    if (reader) await reader.cancel().catch(() => {});
+    return;
+  }
+  connecting = true;
+  ui.connect.disabled = true;
+  try {
+    const selected = await navigator.serial.requestPort();
+    await selected.open({baudRate:115200,dataBits:8,stopBits:1,parity:'none',flowControl:'none'});
+    port = selected;
+    stopping = false;
+    received = 0;
+    lastSample = 0;
+    ui.voltage.textContent = '—';
+    ui.adc.textContent = '—';
+    ui.updated.textContent = 'Sin muestras';
+    ui.state.textContent = 'Esperando datos';
+    ui.subtitle.textContent = 'Puerto abierto. Esperando la LPC1769.';
+    ui.notice.textContent = 'Si no llegan datos, verificá F8 / Resume, P0.10 → RX y GND común.';
+    ui.connect.textContent = 'Desconectar';
+    void receive();
+  } catch (error) {
+    ui.notice.textContent = error.name === 'NotFoundError' ? 'Selección cancelada.' : 'No se pudo abrir el puerto. ' + error.message;
+  } finally {
+    connecting = false;
+    ui.connect.disabled = false;
+  }
+});
+
+setInterval(() => {
+  if (port && lastSample && Date.now() - lastSample > 2500) {
+    ui.state.textContent = 'Sin datos recientes';
+    ui.subtitle.textContent = 'La lectura mostrada corresponde a la última muestra.';
+  }
+},1000);
+
+if (!('serial' in navigator) || !window.isSecureContext) {
+  ui.connect.disabled = true;
+  ui.notice.textContent = 'Web Serial no está disponible. Abrí el archivo en Chrome o Edge de escritorio. Si sigue bloqueado, servilo desde http://localhost.';
+}
+</script>
+</html>
